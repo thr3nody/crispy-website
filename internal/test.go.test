@@ -1,0 +1,135 @@
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+type musicItem struct {
+	id            int
+	external_ids  sql.NullString
+	Name          string
+	Artist        string
+	price         float64
+	seller        sql.NullString
+	Note          sql.NullString
+	purchase_date sql.NullString
+}
+
+func main() {
+	// Connect to the SQLite database
+	db, err := sql.Open("sqlite3", "walletdrain.db")
+	if err != nil {
+		fmt.Printf("Error connecting to database: %v\n", err)
+		return
+	}
+	defer db.Close()
+
+	// Query to get the first 10 music items
+	rows, err := db.Query("SELECT id, external_ids, Name, Artist, price, seller, Note, purchase_date FROM music WHERE artist='Glitch Cat'")
+	if err != nil {
+		fmt.Printf("Error querying database: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	// Create HTTP client and set user agent
+	client := &http.Client{}
+	ua := "MusicCoverArtFetcher/1.0 (your-email@example.com)"
+	
+	fmt.Println("ID\tARTIST\tRELEASE\tCOVER ART URL (250px)")
+	fmt.Println("-----------------------------------------------")
+
+	// Process each row from the database
+	for rows.Next() {
+		var item musicItem
+		
+		if err := rows.Scan(&item.id, &item.external_ids, &item.Name, &item.Artist, 
+			&item.price, &item.seller, &item.Note, &item.purchase_date); err != nil {
+			fmt.Printf("Error scanning row: %v\n", err)
+			continue
+		}
+		
+		// Search MusicBrainz for the release
+		query := url.QueryEscape(fmt.Sprintf("artist:\"%s\" AND release:\"%s\"", item.Artist, item.Name))
+		req, _ := http.NewRequest("GET", "https://musicbrainz.org/ws/2/release?query="+query+"&fmt=json", nil)
+		req.Header.Set("User-Agent", ua)
+		
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			fmt.Printf("%d\t%s\t%s\tError searching MusicBrainz\n", item.id, item.Artist, item.Name)
+			continue
+		}
+		
+		var mbResp struct {
+			Releases []struct {
+				ID string `json:"id"`
+			} `json:"releases"`
+		}
+		
+		body, _ := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		
+		if err := json.Unmarshal(body, &mbResp); err != nil || len(mbResp.Releases) == 0 {
+			fmt.Printf("%d\t%s\t%s\tNo match found\n", item.id, item.Artist, item.Name)
+			continue
+		}
+		
+		// Get cover art using the MusicBrainz ID
+		req, _ = http.NewRequest("GET", "https://coverartarchive.org/release/"+mbResp.Releases[0].ID, nil)
+		req.Header.Set("User-Agent", ua)
+		
+		resp, err = client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			fmt.Printf("%d\t%s\t%s\tNo cover art available\n", item.id, item.Artist, item.Name)
+			continue
+		}
+		
+		var caResp struct {
+			Images []struct {
+				Thumbnails struct {
+					Img250 string `json:"250"`
+				} `json:"thumbnails"`
+				Front bool `json:"front"`
+			} `json:"images"`
+		}
+		
+		body, _ = ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		
+		if err := json.Unmarshal(body, &caResp); err != nil {
+			fmt.Printf("%d\t%s\t%s\tError parsing cover art data\n", item.id, item.Artist, item.Name)
+			continue
+		}
+		
+		// Find and display the front cover URL
+		coverURL := ""
+		for _, img := range caResp.Images {
+			if img.Front {
+				coverURL = img.Thumbnails.Img250
+				break
+			}
+		}
+		
+		if coverURL == "" {
+			fmt.Printf("%d\t%s\t%s\tNo front cover found\n", item.id, item.Artist, item.Name)
+		} else {
+			fmt.Printf("%d\t%s\t%s\t%s\n", item.id, item.Artist, item.Name, coverURL)
+		}
+		
+		// Respect API rate limits
+		time.Sleep(1 * time.Second)
+	}
+	
+	// Check for errors from iterating over rows
+	if err = rows.Err(); err != nil {
+		fmt.Printf("Error iterating over rows: %v\n", err)
+	}
+}
